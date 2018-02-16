@@ -1,0 +1,295 @@
+pragma solidity ^0.4.17;
+
+contract Dao{
+    //init parameters 
+    uint256 public HoldingTime; 
+    uint256 public GenerationRate;
+    
+    //Address to get token data from
+    address LedgerAddress;
+    
+    function setLedgerAddress (address _LedgerAddress) public { // Set ledger address, must do it
+        LedgerAddress = _LedgerAddress;
+    }
+    
+    // number of addresses participating in voting
+    uint256  NrAddresses = 0;
+    
+    // Size of Pool
+    uint256  PoolMax = 2000000000000000;
+     
+    //Mappings to keep track of Proposed values
+    mapping(address => uint256) ProposedHoldingTime;
+    mapping(address => uint256) ProposedExchangeRate;
+    
+    //used to iterate through addresses
+    mapping(uint256 => address) AddressAtIndex;
+    
+    //total tokens in circulation
+    uint256 TotalTokens;
+    
+    // Can be called by user to Propose a value for ExchangeRate and HoldingTime
+     function SetValue (uint256 _newHT, uint256 _newER) public payable{
+        require(msg.value == 1000000000000000); // cost for vote
+        require(_newER != 0 && _newHT != 0);
+        if(ProposedHoldingTime[msg.sender] == 0){ // if not voted yet
+            NrAddresses++;
+            AddressAtIndex[NrAddresses] = msg.sender; // add to voting addresses
+        }
+        ProposedHoldingTime[msg.sender] = _newHT; // set new proposals
+        ProposedExchangeRate[msg.sender] = _newER;
+        if(this.balance >= PoolMax){ //check if pool is full
+            UpdatePool(msg.sender); // update Golbal Values
+            msg.sender.transfer(PoolMax); // Pay Caller gas used to update DAO
+        } 
+    }
+    
+
+    // Update value
+    function UpdatePool(address) private{ // add address as parameter without name
+        uint256 HTCount = 0;
+        uint256 ERCount = 0;
+        uint256 NullValues = 0;
+        TotalTokens=GetTotalToken();
+        
+        for(uint256 i = 1; i <= NrAddresses; i++){ //iterate using AddressAtIndex mapping to get addresses
+            uint256 currWeight = GetWeight(AddressAtIndex[i]);
+            if(currWeight == 0){ 
+                NullValues++;
+            }
+            HTCount += ProposedHoldingTime[AddressAtIndex[i]] * currWeight;
+            ERCount += ProposedExchangeRate[AddressAtIndex[i]] * currWeight;
+        }
+        
+        // Update value
+        HoldingTime = HTCount / ((NrAddresses - NullValues) * 1000); // divide per 1000 to set back origianl value
+        GenerationRate = ERCount / ((NrAddresses - NullValues) * 1000);
+        
+
+        // Updates values on Ledger
+        Flocc ledger = Flocc(LedgerAddress);
+        ledger.updateValues(HoldingTime,GenerationRate);
+        ledger.setBalance(msg.sender);
+        
+        // Reset values
+        NrAddresses = 0;
+        ProposedExchangeRate[msg.sender] = 0;
+        ProposedHoldingTime[msg.sender] = 0;
+
+    }
+    
+    // Computes weight using token balance from Ledger constract
+    function GetWeight(address adr) view private returns(uint) { 
+        require(TotalTokens != 0);
+        Flocc ledger = Flocc(LedgerAddress);
+        return (ledger.balanceOf(adr) * 1000) / TotalTokens; // multiplying per 1000 to avoid rounding in integer division
+    }
+    
+    // Gets total amount of tokens in circulation 
+    function GetTotalToken() private view returns(uint256) { 
+        Flocc ledger = Flocc(LedgerAddress);
+        return ledger.totalSupply();
+    }
+    
+    // Proposed HoldingTime and ExchangeRate of caller
+    function GetMyProposals() public view returns (uint256,uint256){
+        return (ProposedHoldingTime[msg.sender], ProposedExchangeRate[msg.sender]);
+    
+    }
+    
+    //Amount currently in pool
+    function GetPool() public view returns(uint){
+       return this.balance / 1000000000000000;
+    }
+    
+     function getBalanceforUser() public returns(uint) {
+        Flocc floccname = Flocc(LedgerAddress);
+        return floccname.getBalance(tx.origin);
+    }
+ }
+contract Owned { //bridge-contract to make DAO the owner
+    address public owner; //address of DAO
+    uint  TotalSupply = 0; //amount of floccs in market
+    uint  decimals = 18; //1 flocc = 10**18 pablo's
+    uint  Floccmax; //Flocc-Cap. Total amount of possible Floccs in the market
+   
+    function Owned() public {
+        owner = msg.sender;
+    }
+ 
+    modifier onlyOwner {
+        require(msg.sender == owner);
+        _;
+    }
+    
+    function transferOwnership(address newOwner, uint _floccmax) public onlyOwner {
+        owner = newOwner;
+        Floccmax = _floccmax;
+    }
+}
+ 
+contract Flocc is  Owned { //actual Token-contract
+    string public name;
+    string public symbol;
+    uint public timestamp;
+    uint private minPointer; //points on oldest relevant transaction on TransactionLedger(mapping)
+    uint private maxPointer; //points on newest transaction on TransactionLedger(mapping)
+    uint public holdingTime; //in seconds
+    uint public generationRate; // every spent ether = generationRate floccs
+    uint public etherAmount; //
+
+    event Transfer(address indexed from, address indexed to, uint value); //not sure if needed!
+    event Approval(address indexed tokenOwner, address indexed spender, uint amount); //not sure if needed!
+ 
+    mapping(address => uint) public balanceOf; //tracks balances
+    mapping(address => mapping(address => uint)) public allowed; //tracks 3rd parties'access
+    mapping (uint => FloccTransaction) transactionLedger; //tracks all Flocc-transactions. later used for re-attribution
+
+    modifier onlyOwner { //modifier to check for owner
+        require(msg.sender==owner);
+        _;
+    }
+    struct FloccTransaction {
+        uint timestamp; //in seconds
+        address owner; //address of owner
+        uint amount; //amount of floccs in this transaction
+    }
+    
+    function setBalance(address _owner) public {
+        balanceOf[_owner] = 0;
+    }
+
+    function Flocc () public { //flocc-constructor
+        name = "Flocc";
+        symbol = "FLO";
+    }
+     
+   function mintToken(address target, uint mintedAmount) public onlyOwner { //creats further Flocc-Coins
+        //UpdateBalances(); //updates balances
+        uint j = 0;
+        if (TotalSupply + mintedAmount > Floccmax) {//all Floccs in market. check for oldest
+            uint hasGotten = 0;
+            uint i = 0;
+            while (hasGotten < mintedAmount) {
+                _transfer(transactionLedger[i].owner,target,transactionLedger[i].amount);
+                hasGotten += transactionLedger[i].amount;
+                i++;
+            }
+        } else { // not all Floccs in market. create new token
+           balanceOf[target] += mintedAmount;
+           TotalSupply += mintedAmount;
+           Transfer(0, owner, mintedAmount);
+           Transfer(owner, target, mintedAmount);
+        }
+        
+    }
+     
+    function transfer(address _to,uint _value) public returns(bool){
+        _transfer(msg.sender, _to, _value);
+    }
+ 
+    function _transfer(address _from,address _to, uint _value) internal {
+        require(_to != 0x0); //not necessairy, required for burning
+        require(balanceOf[_from] >= _value); //has enough floccs
+        require(balanceOf[_to]+_value > balanceOf[_to]); // prevent overflow
+        balanceOf[_from] -= _value; //take floccs away
+        balanceOf[_to] += _value; // give floccs
+        Transfer(_from,_to,_value); //event
+    }
+     
+    function transferFrom (address _from, address _to, uint _value) public returns(bool) { //makes possible to allow 3rd parties to handle your transfer
+        uint allowance = allowed[_from][msg.sender];
+        require(balanceOf[_from] >= _value && allowance >= _value);
+        balanceOf[_from] -= _value;
+        balanceOf[_to] += _value;
+        allowed[_from][msg.sender] -= _value;
+        Transfer(_from, _to, _value);
+        return true;
+    }
+     
+    function balanceOf(address _owner) public returns(uint balance) {
+        for (uint i = minPointer;i<=maxPointer;i++) {
+            if (transactionLedger[i].timestamp < now - holdingTime) { //not valid anymore
+                if(transactionLedger[i].owner==_owner){
+                    balanceOf[_owner]-=transactionLedger[i].amount; // subtrats from balance invalid tokens
+                    transactionLedger[i].amount=0;
+                }
+            }
+        }
+    //update _owner account
+    return balanceOf[_owner];
+    }
+    
+    function getBalance(address _owner)public onlyOwner returns(uint) {
+        for (uint i = minPointer;i<=maxPointer;i++) {//iterate over transactionLedger and check for invalid coins
+            if (transactionLedger[i].timestamp < now - holdingTime) { //not valid anymore
+                if (transactionLedger[i].owner==_owner) {
+                    balanceOf[_owner] -= transactionLedger[i].amount; // substracts from balance invalid tokens
+                    TotalSupply -= transactionLedger[i].amount;
+                    transactionLedger[i].amount = 0;
+                }
+            }
+        }
+        uint reward = calcReward(_owner); //check now for possible token-reward
+        if (reward!=0) { //has right to get floccs
+            mintToken(_owner,reward);
+        }
+
+    return balanceOf[_owner];
+    }
+    
+    function calcReward(address user) internal returns(uint) {
+        //check blockchain-transactions & decide wheter this user gets floccs
+        uint spent = 10;
+        return spent * generationRate; //just until we are able to read the data out. returns 0 if no reward
+    }
+    
+    /*
+     function UpdateBalances() public { //updates balances of all perticipants
+        for (uint i = minPointer;i<maxPointer;i++) {
+            if (transactionLedger[i].timestamp < now - holdingTime) { //not valid anymore
+                balanceOf[transactionLedger[i].owner]-=transactionLedger[i].amount; // subtrats from balance invalid tokens
+                TotalSupply-=transactionLedger[i].amount;
+            }
+        }
+        minPointer=now-holdingTime; // updates pointer
+    }
+    
+    function balanceOf(address tokenOwner) public constant returns (uint balance){
+        UpdateBalances();
+        return balanceOf[tokenOwner];
+    } */
+     
+    function allowance(address tokenOwner, address spender) public view returns(uint remaining) { //returns the amount of which 3rd partie still can access
+        return allowed[tokenOwner][spender];
+    }
+     
+    function approve(address spender, uint amount) public returns(bool success) {//gives you opportunity to give someone an allowance
+        allowed[msg.sender][spender] = amount;
+        Approval(msg.sender,spender,amount);
+        return true;
+    }
+    
+     function GetFloccMax()public view returns (uint){
+        return Floccmax;
+    }
+    
+    function totalSupply() public constant returns (uint){
+        return TotalSupply;
+    }
+     
+    
+    function updateValues(uint _newHT,uint _newER) public onlyOwner {
+        holdingTime = _newHT;
+        generationRate = _newER;
+    }
+    
+    function getThisAddress() view public returns (address) {
+        return this;
+    }
+     
+    function calcUserCap(address user) public returns (uint) { //calculates the max of floccs the user can hold
+        
+    }
+     
+}
